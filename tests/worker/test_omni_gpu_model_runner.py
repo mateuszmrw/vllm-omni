@@ -291,7 +291,7 @@ def _runner_for_request_generator(*, requires_tts_local_generator: bool) -> Omni
     return runner
 
 
-def test_greedy_tts_local_seed_creates_request_generator():
+def test_greedy_tts_local_seed_does_not_create_token_generator():
     runner = _runner_for_request_generator(requires_tts_local_generator=True)
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -300,12 +300,7 @@ def test_greedy_tts_local_seed_creates_request_generator():
     )
     assert sampling_params.sampling_type == SamplingType.GREEDY
 
-    generator = OmniGPUModelRunner._create_request_generator(runner, sampling_params)
-
-    assert generator is not None
-    expected = torch.empty(8).normal_(generator=torch.Generator(device="cpu").manual_seed(42))
-    actual = torch.empty(8).normal_(generator=generator)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert OmniGPUModelRunner._create_request_generator(runner, sampling_params) is None
 
 
 def test_greedy_tts_default_seed_without_marker_stays_unseeded():
@@ -346,6 +341,118 @@ def test_random_seed_request_generator_behavior_is_preserved():
     expected = torch.empty(8).normal_(generator=torch.Generator(device="cpu").manual_seed(17))
     actual = torch.empty(8).normal_(generator=generator)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _runner_for_tts_local_generators(temperature=0.0):
+    runner = _runner_for_request_generator(requires_tts_local_generator=True)
+    runner.input_batch = DummyInputBatch(["seeded", "unseeded"])
+    runner.requests = {
+        "seeded": SimpleNamespace(
+            sampling_params=SamplingParams(temperature=temperature, seed=42, extra_args={"tts_local_seed": 42}),
+        ),
+        # A default token seed must not implicitly seed acoustic noise.
+        "unseeded": SimpleNamespace(sampling_params=SamplingParams(temperature=0.0, seed=42)),
+    }
+    runner._tts_local_generators = {}
+    return runner
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+def test_tts_local_generator_is_separate_from_token_generator(temperature):
+    runner = _runner_for_tts_local_generators(temperature)
+    token_generator = runner._create_request_generator(runner.requests["seeded"].sampling_params)
+    generators = runner._get_tts_local_generators()
+
+    assert set(generators) == {0}
+    acoustic_generator = generators[0]
+    assert acoustic_generator is not token_generator
+    if token_generator is not None:
+        torch.empty(32).exponential_(generator=token_generator)
+    actual = torch.empty(8).normal_(generator=acoustic_generator)
+    expected = torch.empty(8).normal_(generator=torch.Generator().manual_seed(42))
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_tts_local_generator_survives_reordering_and_unscheduled_steps():
+    runner = _runner_for_tts_local_generators()
+    generator = runner._get_tts_local_generators()[0]
+    first_frame = torch.empty(8).normal_(generator=generator)
+
+    runner.input_batch = DummyInputBatch(["unseeded"])
+    assert runner._get_tts_local_generators() == {}
+    runner.input_batch = DummyInputBatch(["unseeded", "seeded"])
+    resumed_generator = runner._get_tts_local_generators()[1]
+    assert resumed_generator is generator
+    second_frame = torch.empty(8).normal_(generator=resumed_generator)
+
+    reference = torch.Generator().manual_seed(42)
+    torch.testing.assert_close(first_frame, torch.empty(8).normal_(generator=reference), atol=0, rtol=0)
+    torch.testing.assert_close(second_frame, torch.empty(8).normal_(generator=reference), atol=0, rtol=0)
+
+
+def test_finished_tts_local_generator_is_released_before_request_id_reuse(monkeypatch):
+    runner = _runner_for_tts_local_generators()
+    original_request = runner.requests["seeded"]
+    generator = runner._get_tts_local_generators()[0]
+    torch.empty(8).normal_(generator=generator)
+    runner.requests = {
+        **runner.requests,
+        "paused": SimpleNamespace(sampling_params=SamplingParams(temperature=0.0, extra_args={"tts_local_seed": 17})),
+    }
+    runner.input_batch = DummyInputBatch(["paused"])
+    paused_generator = runner._get_tts_local_generators()[0]
+    runner.model_intermediate_buffer = {}
+    runner.num_prompt_logprobs = {}
+    runner.encoder_cache = {}
+    runner.late_interaction_runner = Mock()
+    runner.speculative_config = None
+    runner.use_async_spec_decode = False
+    runner._may_reorder_batch = Mock()
+    runner.input_batch = Mock(req_id_to_index={}, req_ids=[])
+    monkeypatch.setattr("vllm_omni.worker.gpu_model_runner.get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    scheduled = SchedulerOutput(
+        total_num_scheduled_tokens=0,
+        num_scheduled_tokens={},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids={"seeded"},
+        free_encoder_mm_hashes=[],
+    )
+
+    runner._update_states(scheduled)
+
+    assert "seeded" not in runner._tts_local_generators
+    assert runner._tts_local_generators["paused"] is paused_generator
+    runner.requests = {**runner.requests, "seeded": original_request}
+    runner.input_batch = DummyInputBatch(["seeded"])
+    replacement = runner._get_tts_local_generators()[0]
+    assert replacement is not generator
+    expected = torch.empty(8).normal_(generator=torch.Generator().manual_seed(42))
+    torch.testing.assert_close(torch.empty(8).normal_(generator=replacement), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("opted_in", [False, True])
+def test_model_forward_supplies_acoustic_generators_only_to_opted_in_output(monkeypatch, opted_in):
+    runner = _runner_for_tts_local_generators()
+    make_output = Mock(return_value=OmniOutput(text_hidden_states=torch.zeros((2, 4)), multimodal_outputs={}))
+    runner.model = SimpleNamespace(requires_tts_local_generator=opted_in, make_omni_output=make_output)
+    runner._build_model_kwargs_extra = lambda: {}
+    upstream_forward = Mock(return_value=torch.zeros((2, 4)))
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", upstream_forward)
+    token_metadata = object()
+
+    runner._model_forward(sampling_metadata=token_metadata, logits_index=torch.tensor([0, 1]))
+
+    assert "tts_local_generators" not in upstream_forward.call_args.kwargs
+    assert make_output.call_args.kwargs["sampling_metadata"] is token_metadata
+    if opted_in:
+        assert make_output.call_args.kwargs["tts_local_generators"][0] is runner._tts_local_generators["seeded"]
+    else:
+        assert "tts_local_generators" not in make_output.call_args.kwargs
+        assert runner._tts_local_generators == {}
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
